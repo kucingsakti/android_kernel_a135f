@@ -27,3 +27,18 @@ include/config/*
 include/generated/*
 .arch/
 .tmp_versions/
+
+# build outputs
+.config
+.version
+.tmp_*
+.tmp/*
+*.log
+arch/arm64/boot/Image
+arch/arm64/boot/Image.gz
+arch/arm64/boot/**/*.dtb*
+arch/arm64/boot/**/*.dtbo*
+**/*.reverse.dts
+**/*.dtout
+**/*.gen.S
+**/__pycache__/

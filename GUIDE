@@ -1,0 +1,327 @@
+Siap — ini aku tulis ulang **script end-to-end** yang *worked* untuk kamu (SM-A135F Android 14, kernel 4.19.198), mulai dari toolchain, build kernel stock, inject KernelSU (legacy) + manual hook (tanpa kprobe), repack `boot.img`, sampai flash via Heimdall. Tinggal kamu copy simpan.
+
+> Catatan: semua path mengacu ke setup kamu:
+>
+> * Kernel source: `/mnt/DATA/SM-A135F/src/Kernel`
+> * Firmware AP tar di: `/mnt/DATA/SM-A135F/raw`
+> * Work dir repack: `/mnt/DATA/SM-A135F/raw/work_ap`
+> * Toolchains: `~/toolchains`
+> * mkbootimg tools: `~/android-tools/mkbootimg`
+> * avbtool: `~/android-tools/avb/avbtool.py`
+
+---
+
+# A) Toolchain Clang r383902 + GCC 4.9 (sesuai README)
+
+## A1. Download clang-r383902 (AOSP archive)
+
+```bash
+mkdir -p ~/toolchains && cd ~/toolchains
+
+curl -L -o clang-r383902.tgz \
+  "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz"
+
+mkdir -p linux-x86/clang-r383902
+tar -xzf clang-r383902.tgz -C linux-x86/clang-r383902
+
+~/toolchains/linux-x86/clang-r383902/bin/clang --version | head -n 2
+```
+
+## A2. Symlink clang ke path yang kernel expect
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+mkdir -p toolchain/clang/host/linux-x86
+ln -snf "$HOME/toolchains/linux-x86/clang-r383902" toolchain/clang/host/linux-x86/clang-r383902
+
+toolchain/clang/host/linux-x86/clang-r383902/bin/clang --version | head -n 2
+```
+
+## A3. Clone GCC 4.9 dari CodeLinaro + checkout tag yang ada binari
+
+```bash
+cd "$HOME/toolchains"
+rm -rf aarch64-linux-android-4.9
+git clone https://git.codelinaro.org/clo/la/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9.git aarch64-linux-android-4.9
+
+cd aarch64-linux-android-4.9
+git checkout webview-m40_r4
+
+ls -lah bin/aarch64-linux-android-gcc
+bin/aarch64-linux-android-gcc --version | head -n 1
+```
+
+## A4. Symlink GCC ke kernel tree
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+mkdir -p toolchain/gcc/linux-x86/aarch64
+ln -snf "$HOME/toolchains/aarch64-linux-android-4.9" toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
+
+ls -lah toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-gcc
+```
+
+---
+
+# B) Build kernel STOCK (yang sukses)
+
+## B1. Dependencies (minimal)
+
+```bash
+sudo apt update
+sudo apt install -y flex bison bc build-essential make libssl-dev libelf-dev dwarves rsync unzip zstd python3 lz4
+```
+
+## B2. Placeholder untuk clean yang sempat error (himax)
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+mkdir -p drivers/input/touchscreen/himax/himax_83xxx_i2c
+: > drivers/input/touchscreen/himax/himax_83xxx_i2c/Makefile
+```
+
+## B3. Build stock sesuai README
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+export PLATFORM_VERSION=12
+export ANDROID_MAJOR_VERSION=s
+export ARCH=arm64
+export SUBARCH=arm64
+
+export CROSS_COMPILE=toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+export CC=toolchain/clang/host/linux-x86/clang-r383902/bin/clang
+
+make clean
+make mrproper
+make exynos850-a13xx_defconfig
+make -j"$(nproc)" 2>&1 | tee build_stock.log
+
+ls -lah arch/arm64/boot/Image
+```
+
+---
+
+# C) KernelSU v0.9.5 + MANUAL HOOK (tanpa kprobe) — ini yang bikin boot normal & bisa lanjut
+
+## C1. Install KernelSU legacy v0.9.5
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+```
+
+## C2. Defconfig: aktifkan KSU, matikan KPROBES (karena kprobe bikin bootloop)
+
+Edit:
+
+```bash
+nano /mnt/DATA/SM-A135F/src/Kernel/arch/arm64/configs/exynos850-a13xx_defconfig
+```
+
+Pastikan:
+
+```text
+CONFIG_KSU=y
+# CONFIG_KPROBES is not set
+# CONFIG_KPROBE_EVENTS is not set
+```
+
+## C3. Manual hooks yang kamu inject (exec/open/read/stat)
+
+> Catatan: kamu sudah berhasil inject dengan `perl`. Ini versi final yang benar (posisi faccessat sudah fix, vfs_read hook harus setelah deklarasi `ssize_t ret;` biar lolos C90).
+
+### C3.1 Inject exec hook (fs/exec.c)
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+# tambah extern sebelum do_execveat_common
+perl -0777 -i -pe 's/(static int do_execveat_common\s*\(.*?\)\s*\{\n)/#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\nextern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n\n$1/sms' fs/exec.c
+
+# inject call tepat setelah "{"
+perl -0777 -i -pe 's/(static int do_execveat_common\s*\(.*?\)\s*\{\n)/$1#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, (void *)&argv, (void *)&envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, (void *)&argv, (void *)&envp, &flags);\n#endif\n/sms' fs/exec.c
+```
+
+### C3.2 Inject faccessat hook (fs/open.c) — versi final yang benar
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+# extern dekat do_faccessat
+perl -0777 -i -pe 's/(long do_faccessat\s*\(.*?\)\s*\{\n)/#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n\n$1/sms' fs/open.c
+
+# inject call hanya di dalam do_faccessat setelah lookup_flags
+perl -0777 -i -pe 's/(long do_faccessat\s*\([^\)]*\)\s*\{.*?unsigned int lookup_flags\s*=\s*LOOKUP_FOLLOW;\n)/$1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n/sms' fs/open.c
+```
+
+### C3.3 Inject vfs_read hook (fs/read_write.c) — harus setelah `ssize_t ret;`
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+# extern sebelum vfs_read
+perl -0777 -i -pe 's/(ssize_t vfs_read\s*\(.*?\)\s*\{\n)/#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif\n\n$1/sms' fs/read_write.c
+
+# pastikan TIDAK ada hook block sebelum deklarasi ret (kalau ada, hapus)
+perl -0777 -i -pe 's/\n#ifdef CONFIG_KSU\n\s*if \(unlikely\(ksu_vfs_read_hook\)\)\n\s*ksu_handle_vfs_read\(&file, &buf, &count, &pos\);\n#endif\n/\n/sm' fs/read_write.c
+
+# inject hook setelah "ssize_t ret;"
+perl -0777 -i -pe 's/(ssize_t vfs_read\s*\(.*?\)\s*\{\s*\n\s*ssize_t ret;\n)/$1\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n/sms' fs/read_write.c
+```
+
+### C3.4 Inject stat hook (fs/stat.c)
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+# extern sebelum vfs_statx
+perl -0777 -i -pe 's/(int vfs_statx\s*\(.*?\)\s*\{\n)/#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n\n$1/sms' fs/stat.c
+
+# inject call setelah lookup_flags
+perl -0777 -i -pe 's/(unsigned int lookup_flags\s*=\s*LOOKUP_FOLLOW\s*\|\s*LOOKUP_AUTOMOUNT;\n)/$1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n/sms' fs/stat.c
+```
+
+### C3.5 Verifikasi hook masuk
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+grep -n "ksu_handle_execveat" fs/exec.c | head
+grep -n "ksu_handle_faccessat" fs/open.c | head
+grep -n "ksu_handle_vfs_read" fs/read_write.c | head
+grep -n "ksu_handle_stat" fs/stat.c | head
+```
+
+## C4. Build kernel manual-hook
+
+```bash
+cd /mnt/DATA/SM-A135F/src/Kernel
+
+export PLATFORM_VERSION=12
+export ANDROID_MAJOR_VERSION=s
+export ARCH=arm64
+export SUBARCH=arm64
+export CROSS_COMPILE=toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+export CC=toolchain/clang/host/linux-x86/clang-r383902/bin/clang
+
+make mrproper
+make exynos850-a13xx_defconfig
+make -j"$(nproc)" 2>&1 | tee build_ksu_manual.log
+
+ls -lah arch/arm64/boot/Image
+```
+
+---
+
+# D) Repack BOOT image (mkbootimg) — worked
+
+## D1. Get mkbootimg tools
+
+```bash
+mkdir -p ~/android-tools && cd ~/android-tools
+git clone https://android.googlesource.com/platform/system/tools/mkbootimg
+```
+
+## D2. Extract AP tar + decompress boot
+
+```bash
+cd /mnt/DATA/SM-A135F/raw
+mkdir -p work_ap && cd work_ap
+
+tar -xvf ../AP_*.tar.md5 boot.img.lz4 dtbo.img.lz4 vbmeta.img.lz4
+lz4 -d boot.img.lz4 boot.img
+
+mkdir -p boot_unpack
+python3 ~/android-tools/mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_unpack
+```
+
+## D3. Replace kernel + repack (header v2 params yang kamu punya)
+
+> Kernel original non-gzip → pakai `Image` (bukan Image.gz).
+
+```bash
+cd /mnt/DATA/SM-A135F/raw/work_ap
+
+cp -f /mnt/DATA/SM-A135F/src/Kernel/arch/arm64/boot/Image boot_unpack/kernel
+
+python3 ~/android-tools/mkbootimg/mkbootimg.py \
+  --header_version 2 \
+  --os_version 14.0.0 \
+  --os_patch_level 2025-11 \
+  --pagesize 0x00000800 \
+  --base 0x00000000 \
+  --kernel_offset 0x10008000 \
+  --ramdisk_offset 0x11000000 \
+  --second_offset 0x00000000 \
+  --tags_offset 0x10000100 \
+  --dtb_offset 0x0000000010000000 \
+  --board SRPUK09B013 \
+  --cmdline "androidboot.hardware=exynos850 androidboot.selinux=enforce loop.max_part=7" \
+  --kernel boot_unpack/kernel \
+  --ramdisk boot_unpack/ramdisk \
+  --dtb boot_unpack/dtb \
+  --output boot_manualksu.img
+
+file boot_manualksu.img
+```
+
+---
+
+# E) Flash via Heimdall — worked (split step)
+
+## E1. Extract STOCK dtbo/vbmeta for “safe” flashing
+
+```bash
+cd /mnt/DATA/SM-A135F/raw
+mkdir -p stock_fix && cd stock_fix
+
+tar -xvf ../AP_*.tar.md5 dtbo.img.lz4 vbmeta.img.lz4
+lz4 -d dtbo.img.lz4 dtbo_stock.img
+lz4 -d vbmeta.img.lz4 vbmeta_stock.img
+```
+
+## E2. Flash BOOT then DTBO+VBMETA (Download Mode)
+
+```bash
+cd /mnt/DATA/SM-A135F/raw/stock_fix
+
+sudo heimdall flash --BOOT /mnt/DATA/SM-A135F/raw/work_ap/boot_manualksu.img --no-reboot
+sudo heimdall flash --DTBO dtbo_stock.img --VBMETA vbmeta_stock.img --resume
+```
+
+> Kalau muncul `Failed to receive session end confirmation!`, biasanya tetap sukses. Force reboot: **Vol Down + Power** 10–15 detik.
+
+---
+
+# F) vbmeta disable (optional) — worked via avbtool (AOSP)
+
+> Ini opsional. Kamu sempat buat vbmeta disabled pakai flags yang benar.
+
+## F1. Get avbtool
+
+```bash
+mkdir -p ~/android-tools && cd ~/android-tools
+git clone https://android.googlesource.com/platform/external/avb
+```
+
+## F2. Build vbmeta_disabled.img
+
+```bash
+cd /mnt/DATA/SM-A135F/raw/work_ap
+
+lz4 -d vbmeta.img.lz4 vbmeta.img
+
+python3 ~/android-tools/avb/avbtool.py make_vbmeta_image \
+  --output vbmeta_disabled.img \
+  --include_descriptors_from_image vbmeta.img \
+  --set_hashtree_disabled_flag \
+  --set_verification_disabled_flag
+
+python3 ~/android-tools/avb/avbtool.py info_image --image vbmeta_disabled.img | head -n 80
+```
+
+---
+
+Kalau kamu mau, aku juga bisa bikin versi “single script” (bash) yang tinggal kamu jalankan ulang dari nol, tapi yang di atas sudah format “catatan” yang enak kamu simpan dan rerun per bagian.
+

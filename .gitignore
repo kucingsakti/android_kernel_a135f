@@ -1,0 +1,34 @@
+# Kernel build artifacts
+.config
+.config.old
+.modules.order
+Module.symvers
+System.map
+vmlinux
+vmlinux.*
+*.o
+*.a
+*.ko
+*.cmd
+*.mod
+*.mod.c
+*.symtypes
+*.order
+*.tmp
+.tmp_*
+.tmp_*.*
+.tmp_versions/
+.version
+missing-syscalls.d
+.missing-syscalls.d
+*.dwo
+*.su
+*.gcno
+*.gcda
+*.lst
+
+# Build outputs
+arch/*/boot/Image
+arch/*/boot/Image.*
+arch/*/boot/dts/**/*.dtb
+arch/*/boot/dts/**/*.dtbo
